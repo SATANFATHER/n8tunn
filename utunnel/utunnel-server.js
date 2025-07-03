@@ -1,278 +1,229 @@
 #!/usr/bin/env node
 
 const http = require('http');
-const https = require('https');
-const fs = require('fs');
+const https = require('https'); // Keep for potential future TLS, though not used with current prompt
+const fs = require('fs');    // Keep for potential future TLS
 const net = require('net');
 const WebSocket = require('ws');
-const url = require('url');
-const { constants } = require('crypto'); // For TLS options
+const readline = require('readline');
+const { constants } = require('crypto'); // Keep for potential future TLS
 
-const argv = require('process').argv.slice(2);
-
-const defaultConfig = {
-    listenHost: '0.0.0.0',
-    listenPort: 8080,
-    cert: null,
-    key: null,
+const SERVER_WS_PORT = 58985;
+const TUNNEL_PORTS = {
+    T1: 29865, // Tunnel 1 public port
+    T2: 29856, // Tunnel 2 public port
+};
+const TUNNEL_PREFIX = {
+    T1: "1:",
+    T2: "2:",
 };
 
-let config = { ...defaultConfig };
-const clientConnections = new Map(); // Stores { forwardPort: { ws: WebSocket, tcpServer: net.Server, externalSocket: net.Socket | null } }
+// Stores the single active client WebSocket and its associated tunnel sockets
+let activeClient = {
+    ws: null,
+    externalSocketT1: null,
+    externalSocketT2: null,
+    tcpServerT1: null,
+    tcpServerT2: null,
+};
 
-function parseArgs() {
-    const args = {};
-    for (let i = 0; i < argv.length; i++) {
-        const arg = argv[i];
-        if (arg.startsWith('--listen')) {
-            const value = arg.includes('=') ? arg.split('=')[1] : argv[++i];
-            if (value.includes(':')) {
-                const [host, port] = value.split(':');
-                args.listenHost = host === '' ? defaultConfig.listenHost : host;
-                args.listenPort = parseInt(port, 10);
-            } else {
-                args.listenPort = parseInt(value, 10);
-            }
-        } else if (arg.startsWith('--cert')) {
-            args.cert = arg.includes('=') ? arg.split('=')[1] : argv[++i];
-        } else if (arg.startsWith('--key')) {
-            args.key = arg.includes('=') ? arg.split('=')[1] : argv[++i];
-        }
-    }
-    if (isNaN(args.listenPort) && args.listenHost === undefined) { // if only host is provided e.g. --listen localhost
-        args.listenPort = defaultConfig.listenPort;
-    } else if (isNaN(args.listenPort)) {
-         args.listenPort = defaultConfig.listenPort;
-    }
-
-
-    return { ...defaultConfig, ...args };
-}
-
-config = parseArgs();
-
-if (config.listenHost === '' || config.listenHost === undefined) { // Handle cases like --listen :80 or --listen 8080
-    config.listenHost = defaultConfig.listenHost;
-}
-
-
-console.log(`Starting utunnel-server with configuration:`);
-console.log(`  WebSocket Listen: ${config.listenHost}:${config.listenPort}`);
-if (config.cert && config.key) {
-    console.log(`  TLS Enabled: Yes`);
-    console.log(`    Cert: ${config.cert}`);
-    console.log(`    Key: ${config.key}`);
-} else {
-    console.log(`  TLS Enabled: No`);
-}
-
-let server;
-
-if (config.cert && config.key) {
-    try {
-        const options = {
-            cert: fs.readFileSync(config.cert),
-            key: fs.readFileSync(config.key),
-            // Enforce TLS 1.2+
-            secureOptions: constants.SSL_OP_NO_TLSv1 | constants.SSL_OP_NO_TLSv1_1,
-        };
-        server = https.createServer(options);
-    } catch (err) {
-        console.error(`[ERROR] Failed to create HTTPS server: ${err.message}`);
-        console.error(`Make sure certificate and key files are valid and paths are correct.`);
-        process.exit(1);
-    }
-} else {
-    server = http.createServer();
-}
-
-const wss = new WebSocket.Server({ server });
-
-wss.on('connection', (ws, req) => {
-    const requestUrl = url.parse(req.url, true);
-    const forwardPort = parseInt(requestUrl.query.forwardPort, 10);
-
-    if (isNaN(forwardPort) || forwardPort <= 0 || forwardPort > 65535) {
-        console.log(`[INFO] Client connection rejected: Invalid or missing forwardPort parameter.`);
-        ws.send(JSON.stringify({ type: 'error', message: 'Invalid or missing forwardPort parameter.' }));
-        ws.terminate();
-        return;
-    }
-
-    if (clientConnections.has(forwardPort)) {
-        const existingClient = clientConnections.get(forwardPort);
-        if (existingClient.ws && existingClient.ws.readyState === WebSocket.OPEN) {
-            console.log(`[INFO] Client connection rejected: forwardPort ${forwardPort} is already in use by an active client.`);
-            ws.send(JSON.stringify({ type: 'error', message: `Port ${forwardPort} is already in use.` }));
-            ws.terminate();
-            return;
-        } else {
-            // Clean up stale entry if WS is not open
-            if (existingClient.tcpServer) {
-                existingClient.tcpServer.close();
-            }
-            clientConnections.delete(forwardPort);
-            console.log(`[INFO] Cleaned up stale client for forwardPort ${forwardPort}.`);
-        }
-    }
-
-    console.log(`[INFO] Client connected, requesting forwardPort: ${forwardPort}`);
-
-    const clientEntry = {
-        ws: ws,
-        tcpServer: null,
-        externalSocket: null,
-        forwardPort: forwardPort
-    };
-    clientConnections.set(forwardPort, clientEntry);
-
-    const tcpServer = net.createServer();
-    clientEntry.tcpServer = tcpServer;
-
-    tcpServer.on('connection', (externalSocket) => {
-        console.log(`[INFO][${forwardPort}] External connection received.`);
-
-        if (clientEntry.externalSocket && clientEntry.externalSocket.readyState !== 'closed') {
-            console.log(`[WARN][${forwardPort}] Tunnel is busy. Rejecting new external connection.`);
-            externalSocket.write('HTTP/1.1 503 Service Unavailable\r\n\r\nTunnel busy. Please try again later.\r\n');
-            externalSocket.end();
-            return;
-        }
-
-        clientEntry.externalSocket = externalSocket;
-        console.log(`[INFO][${forwardPort}] Tunnel established with external client.`);
-        ws.send(JSON.stringify({ type: 'control', action: 'newConnection' }));
-
-
-        // Pipe data: externalSocket <-> WebSocket
-        externalSocket.on('data', (data) => {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(data);
-            }
-        });
-
-        externalSocket.on('close', () => {
-            console.log(`[INFO][${forwardPort}] External connection closed.`);
-            if (clientEntry.externalSocket === externalSocket) {
-                clientEntry.externalSocket = null;
-            }
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'control', action: 'remoteClose' }));
-            }
-        });
-
-        externalSocket.on('error', (err) => {
-            console.error(`[ERROR][${forwardPort}] External socket error: ${err.message}`);
-            if (clientEntry.externalSocket === externalSocket) {
-                clientEntry.externalSocket = null;
-            }
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'control', action: 'remoteError', message: err.message }));
-            }
-        });
-
-        // Clear externalSocket on ws message error or if ws is not open
-        const messageHandler = (message) => {
-            // If message is Buffer, it's data. If string, could be control.
-            // For now, assume all messages from client are data for externalSocket
-            if (externalSocket.writable && !externalSocket.destroyed) {
-                 try {
-                    if (Buffer.isBuffer(message)) {
-                        externalSocket.write(message);
-                    } else if (typeof message === 'string') {
-                        // Attempt to parse as JSON for control messages from client
-                        try {
-                            const parsed = JSON.parse(message);
-                            if (parsed.type === 'control' && parsed.action === 'clientCloseTunnel') {
-                                console.log(`[INFO][${forwardPort}] Client requested tunnel closure.`);
-                                if (externalSocket) externalSocket.destroy();
-                                clientEntry.externalSocket = null;
-                            }
-                        } catch (e) {
-                            // Not a JSON control message, treat as string data
-                            externalSocket.write(message);
-                        }
-                    }
-                } catch (e) {
-                    console.error(`[ERROR][${forwardPort}] Error writing to external socket: ${e.message}. Closing external socket.`);
-                    if (externalSocket) externalSocket.destroy();
-                    clientEntry.externalSocket = null;
-                     // Also remove this specific listener to prevent issues if ws stays open for a new external cxn
-                    ws.off('message', messageHandler);
-                }
-            }
-        };
-        ws.on('message', messageHandler);
-
-        // Ensure this specific message handler is removed when the external socket closes or ws closes for this tunnel
-        externalSocket.on('close', () => {
-            ws.off('message', messageHandler);
-        });
-        ws.on('close', () => { // Also remove if ws itself closes
-             ws.off('message', messageHandler);
-        });
-
-
-    });
-
-    tcpServer.on('error', (err) => {
-        console.error(`[ERROR][${forwardPort}] TCP Server error for port ${forwardPort}: ${err.message}`);
-        ws.send(JSON.stringify({ type: 'error', message: `Failed to listen on port ${forwardPort}: ${err.code === 'EADDRINUSE' ? 'Port already in use by another application.' : err.message}` }));
-        // No ws.terminate() here, client might want to try different port or server might recover
-        // However, we must clean up the clientConnections entry for this port
-        if (clientConnections.get(forwardPort) === clientEntry) {
-            clientConnections.delete(forwardPort);
-        }
-        if (clientEntry.ws.readyState === WebSocket.OPEN) {
-            clientEntry.ws.close(1011, `TCP Server error on forwardPort ${forwardPort}`);
-        }
-    });
-
-    tcpServer.listen(forwardPort, config.listenHost, () => { // Listen on configured host or 0.0.0.0
-        console.log(`[INFO] TCP server listening on ${config.listenHost}:${forwardPort} for client.`);
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'info', message: `Server is now listening on public port ${forwardPort}` }));
-        }
-    });
-
-    ws.on('close', () => {
-        console.log(`[INFO][${forwardPort}] Client for forwardPort ${forwardPort} disconnected.`);
-        if (clientEntry.tcpServer) {
-            clientEntry.tcpServer.close(() => {
-                console.log(`[INFO][${forwardPort}] TCP server on port ${forwardPort} shut down.`);
-            });
-        }
-        if (clientEntry.externalSocket) {
-            clientEntry.externalSocket.destroy();
-            clientEntry.externalSocket = null;
-        }
-        // Check if this clientEntry is still the one associated with the forwardPort before deleting
-        if (clientConnections.get(forwardPort) === clientEntry) {
-            clientConnections.delete(forwardPort);
-        }
-    });
-
-    ws.on('error', (err) => {
-        console.error(`[ERROR][${forwardPort}] WebSocket error for client on port ${forwardPort}: ${err.message}`);
-        // ws.on('close') will handle cleanup
-    });
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
 });
 
-server.listen(config.listenPort, config.listenHost, () => {
-    console.log(`[INFO] utunnel-server WebSocket listening on ${config.listenHost}:${config.listenPort}`);
+function promptForIP(callback) {
+    rl.question('Enter the External (Public) Server IP Address to listen on: ', (ipAddress) => {
+        if (!ipAddress || ipAddress.trim() === '') {
+            console.error('[ERROR] IP Address cannot be empty. Please provide a valid IP.');
+            promptForIP(callback); // Re-prompt
+        } else {
+            // Basic IP validation (not exhaustive)
+            if (!/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(ipAddress) && ipAddress !== '0.0.0.0' && ipAddress.toLowerCase() !== 'localhost') {
+                 // Allow '0.0.0.0' and 'localhost' for flexibility
+                // A more robust validation might be needed for production if specific formats are required
+                console.warn(`[WARN] The entered IP "${ipAddress}" might not be a standard IPv4 address. Proceeding, but ensure it's correct.`);
+            }
+            callback(ipAddress.trim());
+        }
+    });
+}
+
+function startServer(listenIp) {
+    // For now, only HTTP server for WebSocket. TLS could be added back if needed.
+    const server = http.createServer((req, res) => {
+        // Basic response for HTTP requests to the WebSocket port
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('utunnel-server WebSocket endpoint. Please connect via WebSocket client.\n');
+    });
+    const wss = new WebSocket.Server({ server });
+
+    wss.on('connection', (wsClient, req) => {
+        if (activeClient.ws && activeClient.ws.readyState === WebSocket.OPEN) {
+            console.log('[WARN] Another client tried to connect while one is already active. Rejecting new client.');
+            wsClient.send(JSON.stringify({ type: 'error', message: 'Server busy with another client.' }));
+            wsClient.terminate();
+            return;
+        }
+
+        console.log('[INFO] Client connected via WebSocket.');
+        activeClient.ws = wsClient;
+
+        wsClient.on('message', (message) => {
+            const messageString = message.toString();
+            if (messageString.startsWith(TUNNEL_PREFIX.T1)) {
+                if (activeClient.externalSocketT1 && activeClient.externalSocketT1.writable) {
+                    activeClient.externalSocketT1.write(messageString.substring(TUNNEL_PREFIX.T1.length));
+                }
+            } else if (messageString.startsWith(TUNNEL_PREFIX.T2)) {
+                if (activeClient.externalSocketT2 && activeClient.externalSocketT2.writable) {
+                    activeClient.externalSocketT2.write(messageString.substring(TUNNEL_PREFIX.T2.length));
+                }
+            } else {
+                console.log(`[WARN] Received unhandled message from client: ${messageString.substring(0,100)}...`);
+            }
+        });
+
+        wsClient.on('close', () => {
+            console.log('[INFO] Client WebSocket disconnected.');
+            if (activeClient.externalSocketT1) activeClient.externalSocketT1.destroy();
+            if (activeClient.externalSocketT2) activeClient.externalSocketT2.destroy();
+            activeClient.ws = null;
+            activeClient.externalSocketT1 = null;
+            activeClient.externalSocketT2 = null;
+        });
+
+        wsClient.on('error', (err) => {
+            console.error(`[ERROR] Client WebSocket error: ${err.message}`);
+            // 'close' event will usually follow
+        });
+    });
+
+    server.listen(SERVER_WS_PORT, listenIp, () => {
+        console.log(`[INFO] WebSocket server listening on ${listenIp}:${SERVER_WS_PORT}`);
+        setupTunnelListeners(); // Setup TCP listeners after WS server is up
+    });
+
+    server.on('error', (err) => {
+        console.error(`[FATAL] Failed to start WebSocket server on ${listenIp}:${SERVER_WS_PORT}: ${err.message}`);
+        process.exit(1);
+    });
+}
+
+function setupTunnelListeners() {
+    // Tunnel 1 (Port 29865)
+    activeClient.tcpServerT1 = net.createServer((socket) => {
+        if (!activeClient.ws || activeClient.ws.readyState !== WebSocket.OPEN) {
+            console.log(`[WARN][T1:${TUNNEL_PORTS.T1}] External connection received, but no active client WS. Rejecting.`);
+            socket.end('No active tunnel client connected to the server.\n');
+            return;
+        }
+        if (activeClient.externalSocketT1 && activeClient.externalSocketT1.readyState !== 'closed') {
+            console.log(`[WARN][T1:${TUNNEL_PORTS.T1}] Tunnel 1 busy. Rejecting new external connection.`);
+            socket.end('Tunnel 1 is busy. Please try again later.\n');
+            return;
+        }
+        console.log(`[INFO][T1:${TUNNEL_PORTS.T1}] External connection received for Tunnel 1.`);
+        activeClient.externalSocketT1 = socket;
+        activeClient.ws.send(JSON.stringify({ type: 'control', tunnelId: 'T1', action: 'newConnection' }));
+
+
+        socket.on('data', (data) => {
+            if (activeClient.ws && activeClient.ws.readyState === WebSocket.OPEN) {
+                // Send raw buffer prefixed by tunnel ID buffer
+                activeClient.ws.send(Buffer.concat([Buffer.from(TUNNEL_PREFIX.T1), data]), { binary: true });
+            }
+        });
+        socket.on('close', () => {
+            console.log(`[INFO][T1:${TUNNEL_PORTS.T1}] External connection for Tunnel 1 closed.`);
+            if (activeClient.externalSocketT1 === socket) activeClient.externalSocketT1 = null;
+            if (activeClient.ws && activeClient.ws.readyState === WebSocket.OPEN) {
+                activeClient.ws.send(JSON.stringify({ type: 'control', tunnelId: 'T1', action: 'remoteClose' }));
+            }
+        });
+        socket.on('error', (err) => {
+            console.error(`[ERROR][T1:${TUNNEL_PORTS.T1}] External socket error for Tunnel 1: ${err.message}`);
+            if (activeClient.externalSocketT1 === socket) activeClient.externalSocketT1 = null;
+             if (activeClient.ws && activeClient.ws.readyState === WebSocket.OPEN) {
+                activeClient.ws.send(JSON.stringify({ type: 'control', tunnelId: 'T1', action: 'remoteError', message: err.message }));
+            }
+        });
+    });
+
+    activeClient.tcpServerT1.listen(TUNNEL_PORTS.T1, '0.0.0.0', () => {
+        // Log combined message later
+    });
+    activeClient.tcpServerT1.on('error', (err) => {
+        console.error(`[FATAL][T1:${TUNNEL_PORTS.T1}] Failed to listen on 0.0.0.0:${TUNNEL_PORTS.T1}: ${err.message}`);
+        process.exit(1);
+    });
+
+    // Tunnel 2 (Port 29856)
+    activeClient.tcpServerT2 = net.createServer((socket) => {
+         if (!activeClient.ws || activeClient.ws.readyState !== WebSocket.OPEN) {
+            console.log(`[WARN][T2:${TUNNEL_PORTS.T2}] External connection received, but no active client WS. Rejecting.`);
+            socket.end('No active tunnel client connected to the server.\n');
+            return;
+        }
+        if (activeClient.externalSocketT2 && activeClient.externalSocketT2.readyState !== 'closed') {
+            console.log(`[WARN][T2:${TUNNEL_PORTS.T2}] Tunnel 2 busy. Rejecting new external connection.`);
+            socket.end('Tunnel 2 is busy. Please try again later.\n');
+            return;
+        }
+        console.log(`[INFO][T2:${TUNNEL_PORTS.T2}] External connection received for Tunnel 2.`);
+        activeClient.externalSocketT2 = socket;
+        activeClient.ws.send(JSON.stringify({ type: 'control', tunnelId: 'T2', action: 'newConnection' }));
+
+
+        socket.on('data', (data) => {
+            if (activeClient.ws && activeClient.ws.readyState === WebSocket.OPEN) {
+                activeClient.ws.send(Buffer.concat([Buffer.from(TUNNEL_PREFIX.T2), data]), { binary: true });
+            }
+        });
+        socket.on('close', () => {
+            console.log(`[INFO][T2:${TUNNEL_PORTS.T2}] External connection for Tunnel 2 closed.`);
+            if (activeClient.externalSocketT2 === socket) activeClient.externalSocketT2 = null;
+            if (activeClient.ws && activeClient.ws.readyState === WebSocket.OPEN) {
+                activeClient.ws.send(JSON.stringify({ type: 'control', tunnelId: 'T2', action: 'remoteClose' }));
+            }
+        });
+        socket.on('error', (err) => {
+            console.error(`[ERROR][T2:${TUNNEL_PORTS.T2}] External socket error for Tunnel 2: ${err.message}`);
+            if (activeClient.externalSocketT2 === socket) activeClient.externalSocketT2 = null;
+            if (activeClient.ws && activeClient.ws.readyState === WebSocket.OPEN) {
+                activeClient.ws.send(JSON.stringify({ type: 'control', tunnelId: 'T2', action: 'remoteError', message: err.message }));
+            }
+        });
+    });
+
+    activeClient.tcpServerT2.listen(TUNNEL_PORTS.T2, '0.0.0.0', () => {
+        // Log combined message after both are confirmed listening
+        if (activeClient.tcpServerT1 && activeClient.tcpServerT1.listening && activeClient.tcpServerT2 && activeClient.tcpServerT2.listening) {
+             console.log(`Server started successfully. Tunnels established on ports ${TUNNEL_PORTS.T1} and ${TUNNEL_PORTS.T2}`);
+        }
+    });
+    activeClient.tcpServerT2.on('error', (err) => {
+        console.error(`[FATAL][T2:${TUNNEL_PORTS.T2}] Failed to listen on 0.0.0.0:${TUNNEL_PORTS.T2}: ${err.message}`);
+        process.exit(1);
+    });
+}
+
+
+// --- Main ---
+promptForIP((listenIp) => {
+    rl.close(); // Close readline interface after getting input
+    startServer(listenIp);
 });
 
 process.on('SIGINT', () => {
     console.log("\n[INFO] SIGINT received, shutting down server.");
-    wss.clients.forEach(client => {
-        client.close(1000, "Server shutting down");
-    });
-    server.close(() => {
-        console.log("[INFO] HTTP/S server closed.");
-        process.exit(0);
-    });
-    // Force exit if server doesn't close gracefully
+    if (activeClient.ws) {
+        activeClient.ws.close(1000, "Server shutting down");
+    }
+    if (activeClient.tcpServerT1) activeClient.tcpServerT1.close();
+    if (activeClient.tcpServerT2) activeClient.tcpServerT2.close();
+    // Give a moment for graceful shutdown
     setTimeout(() => {
-        process.exit(1);
-    }, 5000);
+        process.exit(0);
+    }, 500);
 });

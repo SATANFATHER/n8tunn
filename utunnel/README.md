@@ -1,169 +1,149 @@
-# utunnel - Secure Reverse TCP Tunnel over WebSocket
+# utunnel - Secure Reverse TCP Tunnel over WebSocket (Binary Version)
 
-`utunnel` is a command-line tool that implements a secure reverse TCP tunnel over WebSocket. It allows you to expose a local TCP service (e.g., SSH, web server) running on a machine behind a NAT or firewall to the internet via a publicly accessible server.
+`utunnel` is a command-line tool that implements a reverse TCP tunnel over WebSocket. This version is designed to be packaged into standalone binaries (`./server` and `./client`) for easy use, with hardcoded ports and interactive prompts for IP addresses.
+
+It allows you to expose local TCP services running on a machine behind a NAT or firewall to users who can connect to specific ports on your public server.
 
 The system consists of two components:
-1.  `utunnel-server`: Runs on a publicly accessible server, listens for WebSocket connections from clients, and forwards traffic from public ports to the respective clients.
-2.  `utunnel-client`: Runs on the machine with the local TCP service, connects to the `utunnel-server`, and tunnels data between the server and the local service.
+1.  `./server`: Runs on a publicly accessible server. It prompts for the public IP it should use, listens for WebSocket connections from a single `./client`, and forwards traffic from two predefined public ports (`29865`, `29856`) to the client over the WebSocket.
+2.  `./client`: Runs on the machine with the local TCP services. It prompts for the server's IP address, connects to the `./server`, and tunnels data between the server and two predefined local services (`127.0.0.1:29865`, `127.0.0.1:29856`).
 
 ## Features
 
-*   **Reverse Tunneling**: Expose local services from private networks.
-*   **Secure Communication**: Supports TLS encryption (wss://) for the WebSocket connection.
-*   **Configurable Ports**: Both server and client allow configuration of listening and target ports.
+*   **Simplified Operation**: Prompts for IP addresses, uses hardcoded ports for tunnels.
+*   **Dual Tunnel Multiplexing**: Supports two distinct TCP tunnels over a single WebSocket connection.
+*   **Secure Communication**: Uses WebSockets (`ws://`). TLS (`wss://`) setup is not part of the interactive prompt in this version but the underlying code structure could be adapted.
 *   **Automatic Reconnection**: Client attempts to reconnect to the server with exponential backoff if the connection is lost.
-*   **Simple CLI**: Easy-to-use command-line interface for both server and client.
-*   **Essential Dependencies**: Uses only `ws` for WebSockets and built-in Node.js modules.
+*   **Standalone Binaries**: Designed to be packaged with tools like `pkg` for Linux.
 
-## Prerequisites
+## Prerequisites for Running Source / Building Binaries
 
-*   Node.js (version 12.x or newer recommended)
+*   Node.js (version 18.x or newer recommended for `pkg` target `node18`)
 *   npm (usually comes with Node.js)
 
-## Installation
+## Installation (from Source)
 
 1.  **Clone the repository (or download the files):**
     ```bash
     # If you have git
     # git clone <repository_url>
     # cd utunnel
-
-    # Or, ensure you have utunnel-server.js and utunnel-client.js in a directory.
-    # Make sure package.json is present or run `npm init -y` if setting up manually.
+    # Or, ensure you have utunnel-server.js, utunnel-client.js, and package.json in a directory.
     ```
 
 2.  **Install dependencies:**
     Navigate to the `utunnel` directory in your terminal and run:
     ```bash
-    npm install ws
+    npm install
     ```
-    (If you already have the `node_modules` directory from previous steps, you might skip this if `ws` is listed in `package.json`'s dependencies and installed).
 
-3.  **Make scripts executable (if not already):**
+## Building the Binaries (`./server`, `./client`)
+
+This project is configured to use `pkg` to create standalone Linux executables.
+
+1.  **Install `pkg` globally (if you haven't already):**
     ```bash
-    chmod +x utunnel-server.js
-    chmod +x utunnel-client.js
+    npm install -g pkg
     ```
 
-## Usage
+2.  **Navigate to the `utunnel` project directory.**
 
-### `utunnel-server`
+3.  **Run the build script:**
+    ```bash
+    npm run build
+    ```
+    This will execute `pkg` to create two files in the `utunnel` directory:
+    *   `server` (for Linux x64)
+    *   `client` (for Linux x64)
 
-The server component listens for WebSocket connections from `utunnel-client` instances.
+    *Note: The `pkg` target in `package.json` is `node18-linux-x64`. You can change this in `package.json` if you need to target other Node.js versions or architectures.*
 
-**Command:**
-```bash
-./utunnel-server.js [options]
-```
+## Usage (Running Binaries)
 
-**Options:**
+### `./server` (Server Component)
 
-*   `--listen <[host:]port>`: Specifies the host and port for the WebSocket server to listen on.
-    *   Default: `0.0.0.0:8080`
-    *   Examples:
-        *   `--listen :9000` (listens on port 9000 on all interfaces)
-        *   `--listen 127.0.0.1:8080` (listens on localhost port 8080)
-*   `--cert <path_to_cert.pem>`: Path to the SSL certificate file (for TLS/wss).
-*   `--key <path_to_key.pem>`: Path to the SSL private key file (for TLS/wss).
+1.  Place the `server` binary on your publicly accessible Linux server.
+2.  Make it executable: `chmod +x server`.
+3.  Run it:
+    ```bash
+    ./server
+    ```
+4.  It will prompt: `Enter the External (Public) Server IP Address to listen on: `
+    *   Enter the public IP address of your server where clients should connect. You can also use `0.0.0.0` to listen on all available network interfaces on the server.
+5.  Upon successful startup, it will display:
+    `Server started successfully. Tunnels established on ports 29865 and 29856`
 
 **Server Operation:**
-The server waits for clients to connect. Each client, upon connection, specifies a `forwardPort` via its WebSocket URL (e.g., `ws://server_ip:8080?forwardPort=2222`). The `utunnel-server` will then start a new TCP listener on `0.0.0.0:<forwardPort>`. Any traffic coming to this `<forwardPort>` on the server will be tunneled to the client that registered it.
-
-**Example (HTTP - No TLS):**
-```bash
-./utunnel-server.js --listen :8080
-```
-Server will listen for WebSocket connections on `0.0.0.0:8080`.
-
-**Example (HTTPS - With TLS):**
-You'll need an SSL certificate and a private key. For testing, you can generate a self-signed certificate:
-```bash
-openssl genrsa -out key.pem 2048
-openssl req -new -key key.pem -out csr.pem
-openssl x509 -req -days 365 -in csr.pem -signkey key.pem -out cert.pem
-```
-Then run the server:
-```bash
-./utunnel-server.js --listen :8443 --cert ./cert.pem --key ./key.pem
-```
-Server will listen for secure WebSocket (wss) connections on `0.0.0.0:8443`.
+*   Listens for WebSocket connections on `<entered_IP>:58985`.
+*   Listens for incoming TCP connections on `0.0.0.0:29865` (Tunnel 1) and `0.0.0.0:29856` (Tunnel 2).
+*   Supports one active `./client` connection at a time.
+*   Traffic from port `29865` is multiplexed to the client with a `"1:"` prefix.
+*   Traffic from port `29856` is multiplexed to the client with a `"2:"` prefix.
 
 ---
 
-### `utunnel-client`
+### `./client` (Client Component)
 
-The client component connects to the `utunnel-server` and makes a local TCP service available through the tunnel.
-
-**Command:**
-```bash
-./utunnel-client.js --server <server_websocket_url> --local-service <host:port>
-```
-
-**Options:**
-
-*   `--server <ws[s]://host:port?forwardPort=publicPort>`: **(Required)** The full WebSocket URL of the `utunnel-server`.
-    *   The `?forwardPort=<publicPort>` query parameter is crucial. It tells the server which port it should open to the public internet for this tunnel. This `publicPort` on the server will then forward traffic to your client's `--local-service`.
-*   `--local-service <[host:]port>` or `--target <[host:]port>`: **(Required)** The local TCP service that the client should forward tunnelled traffic to.
-    *   Default host if only port is specified: `127.0.0.1`
-    *   Examples:
-        *   `--local-service 127.0.0.1:22` (for an SSH server)
-        *   `--local-service :3000` (for a web server on `127.0.0.1:3000`)
-        *   `--target 192.168.1.100:80` (to expose a service on another machine on the local network)
+1.  Place the `client` binary on the Linux machine that has the local services you want to expose (e.g., your machine in Iran).
+2.  Make it executable: `chmod +x client`.
+3.  Run it:
+    ```bash
+    ./client
+    ```
+4.  It will prompt: `Enter the Server IP Address to connect to: `
+    *   Enter the public IP address of your `./server` (the same IP you entered when starting the server).
+5.  Upon successful connection to the server, it will display:
+    `Connected to server. Tunnels established.`
 
 **Client Operation:**
-The client establishes a WebSocket connection to the server. The `forwardPort` in the server URL tells the server which public port to open. When the server receives a connection on that public port, it signals the client, which then connects to the specified `local-service`. Data is then piped between the server (via WebSocket) and the local service.
+*   Connects to the server's WebSocket at `<entered_server_IP>:58985`.
+*   Handles multiplexed traffic:
+    *   Data received from the server prefixed with `"1:"` is forwarded to the local TCP service at `127.0.0.1:29865`.
+    *   Data received from the server prefixed with `"2:"` is forwarded to the local TCP service at `127.0.0.1:29856`.
+*   Data originating from `127.0.0.1:29865` is prefixed with `"1:"` and sent to the server.
+*   Data originating from `127.0.0.1:29856` is prefixed with `"2:"` and sent to the server.
+*   If the connection to the server drops, it will attempt to reconnect automatically.
 
-**Example (Connecting to an HTTP server):**
-Suppose `utunnel-server` is running on `example.com:8080`. You want to expose your local SSH server (running on `127.0.0.1:22`) through the server's public port `2222`.
-```bash
-./utunnel-client.js --server ws://example.com:8080?forwardPort=2222 --local-service 127.0.0.1:22
-```
-Now, connecting to `example.com:2222` (e.g., `ssh user@example.com -p 2222`) will be tunneled to your local machine's port 22.
+**Example Flow:**
 
-**Example (Connecting to an HTTPS server with self-signed cert):**
-If `utunnel-server` is using a self-signed certificate on `example.com:8443`, you might need to tell Node.js to allow it:
-```bash
-NODE_TLS_REJECT_UNAUTHORIZED=0 ./utunnel-client.js --server wss://example.com:8443?forwardPort=2223 --local-service 127.0.0.1:22
-```
-**Warning:** `NODE_TLS_REJECT_UNAUTHORIZED=0` disables TLS certificate validation and should only be used for testing with self-signed certificates. For production, use valid certificates.
+1.  **On your server machine (e.g., a VPS):**
+    *   Run `./server`.
+    *   Enter its public IP (e.g., `YOUR_SERVER_PUBLIC_IP`).
+    *   Server confirms it's listening and tunnels are ready.
 
-## Basic Security Considerations
+2.  **On your local machine (e.g., in Iran):**
+    *   Ensure you have services running on `127.0.0.1:29865` and `127.0.0.1:29856`. For testing, you can use `netcat`:
+        *   Terminal 1: `nc -l -p 29865 -k -e /bin/cat` (simple echo for tunnel 1)
+        *   Terminal 2: `nc -l -p 29856 -k -e /bin/cat` (simple echo for tunnel 2)
+    *   Run `./client`.
+    *   Enter the server's public IP (`YOUR_SERVER_PUBLIC_IP`).
+    *   Client confirms connection.
 
-*   **TLS Encryption**: Always use `wss://` (TLS) for the server-client WebSocket connection, especially over untrusted networks. Use valid, trusted certificates in production. The self-signed certificate method is for testing/development only.
-*   **Firewall**: On the server, ensure your firewall allows incoming connections on the WebSocket port (e.g., 8080) and any `forwardPort`s you intend to use.
-*   **`forwardPort` Exposure**: Be aware that any `forwardPort` opened by the server is potentially accessible from the internet. Only forward services you intend to expose.
-*   **Authentication (Not Implemented)**: This version of `utunnel` does not implement any authentication between the client and server beyond the WebSocket connection. Anyone who knows your server's address and a free `forwardPort` could potentially connect a client. For enhanced security, a future version might include API keys or other authentication mechanisms.
-*   **Input Validation**: The server validates the `forwardPort` parameter. The client validates its parameters.
-*   **Rate Limiting (Basic)**: The server prevents multiple clients from claiming the same `forwardPort` simultaneously. Reconnection attempts by the client use exponential backoff. More sophisticated rate limiting is not implemented.
-*   **Service Security**: The security of the service being tunneled (e.g., your local SSH server, web application) is your responsibility. Ensure it is properly configured and secured.
+3.  **External Access:**
+    *   Users can now connect to `YOUR_SERVER_PUBLIC_IP:29865`. This traffic will be tunnelled to your local machine's `127.0.0.1:29865`.
+    *   Users can also connect to `YOUR_SERVER_PUBLIC_IP:29856`. This traffic will be tunnelled to your local machine's `127.0.0.1:29856`.
+
+## Security Considerations
+
+*   **No TLS by Default in Binary Version**: This simplified binary version currently uses `ws://` (unencrypted WebSockets) because prompting for certificate paths would complicate the "minimal user interaction" goal. For secure communication, you would need to:
+    *   Modify the server to load certificate files (potentially via fixed paths or further prompts).
+    *   Modify the client to use `wss://` and handle certificate validation (e.g. `NODE_TLS_REJECT_UNAUTHORIZED=0` for self-signed certs during testing, or proper CA validation for production).
+*   **Server Exposure**: The IP address you enter for the server makes its WebSocket port (`58985`) and tunnel ports (`29865`, `29856`) listen on that IP. If you use `0.0.0.0` for the server's listening IP, it listens on all interfaces. Ensure your server's firewall is configured appropriately.
+*   **Single Client**: The server is designed for a single active client. No specific authentication is implemented beyond this.
+*   **Service Security**: The security of the services running on your local `127.0.0.1:29865` and `127.0.0.1:29856` is your responsibility.
 
 ## Troubleshooting
 
-*   **"Error: listen EADDRINUSE" on Server**: This means the port the server is trying to listen on (either the WebSocket port or a `forwardPort`) is already in use by another application on the server machine. Change the port or stop the conflicting application.
-*   **Client "Connection Refused"**:
-    *   Ensure the `utunnel-server` is running and accessible from the client machine.
-    *   Check server firewall rules.
-    *   Verify the server URL (hostname/IP and port) in the client command.
-*   **Client "Invalid or missing forwardPort parameter"**: The `--server` URL for the client *must* include `?forwardPort=<number>`.
-*   **Client "Server URL must include a valid ?forwardPort=<number> query parameter."**: The `forwardPort` was missing or not a number.
-*   **TLS/WSS Issues**:
-    *   If using `wss://` with self-signed certificates, the client will likely fail with a certificate validation error unless you set `NODE_TLS_REJECT_UNAUTHORIZED=0` as an environment variable for the client process. **This is insecure for production.**
-    *   Ensure correct paths to `cert.pem` and `key.pem` for the server.
-*   **Tunnel Busy**: The server currently allows only one active tunneled connection per `forwardPort` at a time. If an external user tries to connect while another is active, they will get a "Tunnel busy" message.
-*   **Client stuck at "Attempting to reconnect..."**:
-    *   Server might be down or unreachable.
-    *   Network issues between client and server.
-    *   Server might be rejecting client for some reason (check server logs).
+*   **"Error: listen EADDRINUSE" on Server**: A port the server is trying to use (`58985`, `29865`, or `29856`) is already in use on the server machine.
+*   **Client "Connection Refused" / Reconnection Loop**:
+    *   Ensure `./server` is running and you entered the correct public IP for it.
+    *   Ensure the server's firewall allows connections to port `58985`.
+    *   You entered the correct server IP when starting `./client`.
 *   **Data Not Flowing**:
-    *   Check logs on both client and server for errors.
-    *   Ensure the local service on the client machine is running and accessible on the specified `localServiceHost:localServicePort`.
-    *   Firewall on the client machine might be blocking connections to the local service.
-
-## Future Enhancements (Optional)
-
-*   Client authentication (e.g., API keys).
-*   Allowing multiple concurrent tunneled connections for a single client/`forwardPort` (multiplexing).
-*   Configuration via files.
-*   More detailed statistics (bandwidth, latency).
-*   Daemonization for server/client processes.
+    *   Check logs on both client and server.
+    *   Ensure your local services are actually running on `127.0.0.1:29865` and `127.0.0.1:29856` on the client machine.
+    *   Check firewalls on both client and server machines.
+*   **Binary Execution Issues on Linux**:
+    *   Ensure the binary has execute permissions (`chmod +x server`, `chmod +x client`).
+    *   If `pkg` was used to build for a different architecture or glibc version than your target Linux, it might not run. Ensure your build target (`-t` option in `pkg`) matches your execution environment.
 ```

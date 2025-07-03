@@ -1,16 +1,35 @@
 {
   "name": "utunnel",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "version": "1.1.0",
+  "description": "A simple reverse TCP tunnel over WebSocket.",
+  "main": "utunnel-server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start-server": "node utunnel-server.js",
+    "start-client": "node utunnel-client.js",
+    "build-server-linux": "pkg -t node18-linux-x64 utunnel-server.js -o server",
+    "build-client-linux": "pkg -t node18-linux-x64 utunnel-client.js -o client",
+    "build": "npm run build-server-linux && npm run build-client-linux"
   },
-  "keywords": [],
-  "author": "",
+  "bin": {
+    "server": "./utunnel-server.js",
+    "client": "./utunnel-client.js"
+  },
+  "keywords": [
+    "tunnel",
+    "websocket",
+    "tcp",
+    "reverse-tunnel",
+    "networking"
+  ],
+  "author": "Jules AI",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
     "ws": "^8.18.3"
+  },
+  "pkg": {
+    "assets": [],
+    "scripts": []
   }
 }
